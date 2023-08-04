@@ -137,6 +137,63 @@ async fn verify_file(
     }
 }
 
+/// Attempt to download a blob from an Azure storage account.
+///
+/// This expects that you've already sized the file to the blob's actual size.
+async fn get_blob(
+    client: BlobClient,
+    f: &mut std::fs::File,
+    prog: impl Fn(u64),
+) -> anyhow::Result<()> {
+    let mut map = unsafe {
+        MmapOptions::new()
+            .map_mut(&*f)
+            .context("failed to map file into memory")?
+    };
+
+    let body = client.get().into_stream();
+
+    // TODO: Track the chunks that were downloaded, and if the download
+    // fails then truncate the file to the last contiguous chunk.
+
+    body.try_for_each_concurrent(None, |mut r| {
+        let prog = &prog;
+        let map = map.as_mut_ptr_range();
+
+        async move {
+            let range = r
+                .content_range
+                .map(|r| r.start as usize..(r.end + 1) as usize)
+                .unwrap_or(0usize..r.blob.properties.content_length as usize);
+            let mut offs = 0usize;
+
+            // SAFETY: Who knows, probably unsafe?
+            // Technically more than one thread should not have mutable access to memory,
+            // but in practice everyone's writing to a blob of bytes.
+            let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
+            let map_slice = &mut map_slice[range];
+
+            while let Some(chunk) = r.data.try_next().await? {
+                prog(chunk.len() as u64);
+
+                map_slice[(offs as usize)..(offs as usize) + chunk.len()]
+                    .copy_from_slice(&chunk[..]);
+
+                offs += chunk.len();
+            }
+
+            Ok(())
+        }
+    })
+    .await
+    .context("failed to download chunks")?;
+
+    map.flush().context("failed to flush mapped file")?;
+    drop(map);
+
+    Ok(())
+}
+
 async fn sync_blobs(
     client: ContainerClient,
     blobs: &[Blob],
@@ -219,7 +276,7 @@ async fn sync_blobs(
                             .with_message(format!("{}", &blob.name)),
                     );
 
-                    let f = std::fs::OpenOptions::new()
+                    let mut f = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
                         .create(true)
@@ -228,52 +285,15 @@ async fn sync_blobs(
                     f.set_len(len).context("failed to set file length")?;
 
                     // The length can be 0 sometimes...
+                    // If it is, then the get request for the blob will fail.
                     if len != 0 {
-                        let mut map = unsafe {
-                            MmapOptions::new()
-                                .map_mut(&f)
-                                .context("failed to map file into memory")?
-                        };
-
                         let bcl = client.blob_client(&blob.name);
-                        let body = bcl.get().into_stream();
-
-                        body.try_for_each_concurrent(None, |mut r| {
-                            let pb = pb.clone();
-                            let fpb = fpb.clone();
-                            let map = map.as_mut_ptr_range();
-
-                            async move {
-                                let range = r
-                                    .content_range
-                                    .map(|r| r.start as usize..(r.end + 1) as usize)
-                                    .unwrap_or(0usize..r.blob.properties.content_length as usize);
-                                let mut offs = 0usize;
-
-                                // SAFETY: Who knows, probably unsafe?
-                                // Technically more than one thread should not have mutable access to memory,
-                                // but in practice everyone's writing to a blob of bytes.
-                                let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
-                                let map_slice = &mut map_slice[range];
-
-                                while let Some(chunk) = r.data.try_next().await? {
-                                    pb.inc(chunk.len() as u64);
-                                    fpb.inc(chunk.len() as u64);
-
-                                    map_slice[(offs as usize)..(offs as usize) + chunk.len()]
-                                        .copy_from_slice(&chunk[..]);
-
-                                    offs += chunk.len();
-                                }
-
-                                Ok(())
-                            }
+                        get_blob(bcl, &mut f, |len| {
+                            pb.inc(len);
+                            fpb.inc(len);
                         })
                         .await
-                        .context("failed to download file")?;
-
-                        map.flush().context("failed to flush mapped file")?;
-                        drop(map);
+                        .context("failed to get blob")?;
                     }
 
                     // Setup file times.

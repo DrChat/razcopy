@@ -16,6 +16,8 @@ Unlike `azcopy`, this tool downloads files directly to the hard disk (azcopy dow
 
 ✳️ Synchronize data between Local <=> Blob Storage, Blob Storage <=> File Storage, and Local <=> File Storage.
 
+✅ Fails to download files randomly.
+
 ❌ Delete blobs or files from an Azure storage account
 
 ❌ Copy objects, directories, and buckets from Amazon Web Services (AWS) to Azure Blob Storage (Blobs only).

@@ -16,6 +16,8 @@ Unlike `azcopy`, this tool downloads files directly to the hard disk (azcopy dow
 
 ✳️ Synchronize data between Local <=> Blob Storage, Blob Storage <=> File Storage, and Local <=> File Storage.
 
+✅ Recover from failures by restarting previous jobs.
+
 ✅ Fails to download files randomly.
 
 ❌ Delete blobs or files from an Azure storage account
@@ -25,5 +27,3 @@ Unlike `azcopy`, this tool downloads files directly to the hard disk (azcopy dow
 ❌ Copy objects, directories, and buckets from Google Cloud Platform (GCP) to Azure Blob Storage (Blobs only).
 
 ❌ List files in a container.
-
-❌ Recover from failures by restarting previous jobs.

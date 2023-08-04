@@ -2,11 +2,13 @@
 use std::{
     fs::FileTimes,
     path::{Path, PathBuf},
+    sync::atomic::AtomicUsize,
 };
 
 use anyhow::{bail, Context};
 use azure_storage::prelude::*;
 use azure_storage_blobs::{blob::BlobProperties, container::operations::BlobItem, prelude::*};
+use bitvec::vec::BitVec;
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar};
@@ -139,54 +141,114 @@ async fn verify_file(
 
 /// Attempt to download a blob from an Azure storage account.
 ///
-/// This expects that you've already sized the file to the blob's actual size.
+/// This expects that you've already sized the file to the blob's final size.
 async fn get_blob(
     client: BlobClient,
+    props: &BlobProperties,
     f: &mut std::fs::File,
+    skip: Option<u64>,
     prog: impl Fn(u64),
 ) -> anyhow::Result<()> {
+    const DEFAULT_CHUNK_SIZE: u64 = 0x1000 * 0x1000;
+
     let mut map = unsafe {
         MmapOptions::new()
             .map_mut(&*f)
             .context("failed to map file into memory")?
     };
 
-    let body = client.get().into_stream();
+    // `skip` should be a multiple of the chunk size.
+    let skip = skip.unwrap_or(0);
+    let skip_chunks = skip / DEFAULT_CHUNK_SIZE;
 
-    // TODO: Track the chunks that were downloaded, and if the download
+    let b = client.get().chunk_size(DEFAULT_CHUNK_SIZE);
+
+    let b = if skip != 0 {
+        // Update progress to reflect skipped contents.
+        prog(skip);
+
+        b.range(skip..props.content_length)
+    } else {
+        b
+    };
+
+    let body = b.into_stream();
+
+    // Track the chunks that were downloaded, and if the download
     // fails then truncate the file to the last contiguous chunk.
+    let mut chunks = BitVec::<AtomicUsize, bitvec::order::Lsb0>::new();
+    chunks.resize(
+        ((props.content_length + (DEFAULT_CHUNK_SIZE - 1)) / DEFAULT_CHUNK_SIZE) as usize,
+        false,
+    );
 
-    body.try_for_each_concurrent(None, |mut r| {
-        let prog = &prog;
-        let map = map.as_mut_ptr_range();
+    // Fill in previously downloaded chunks.
+    if skip != 0 {
+        chunks
+            .get_mut(..skip_chunks as usize)
+            .expect("invalid number of skip chunks")
+            .fill(true);
+    }
 
-        async move {
-            let range = r
-                .content_range
-                .map(|r| r.start as usize..(r.end + 1) as usize)
-                .unwrap_or(0usize..r.blob.properties.content_length as usize);
-            let mut offs = 0usize;
+    let r = body
+        .try_for_each_concurrent(None, |mut r| {
+            let prog = &prog;
+            let map = map.as_mut_ptr_range();
+            let chunks = &chunks;
 
-            // SAFETY: Who knows, probably unsafe?
-            // Technically more than one thread should not have mutable access to memory,
-            // but in practice everyone's writing to a blob of bytes.
-            let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
-            let map_slice = &mut map_slice[range];
+            async move {
+                let range = r
+                    .content_range
+                    .map(|r| r.start as usize..(r.end + 1) as usize)
+                    .unwrap_or(0usize..r.blob.properties.content_length as usize);
+                let mut offs = 0usize;
 
-            while let Some(chunk) = r.data.try_next().await? {
-                prog(chunk.len() as u64);
+                // SAFETY: Who knows, probably unsafe?
+                // Technically more than one thread should not have mutable access to memory,
+                // but in practice everyone's writing to a blob of bytes.
+                let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
+                let map_slice = &mut map_slice[range.clone()];
 
-                map_slice[(offs as usize)..(offs as usize) + chunk.len()]
-                    .copy_from_slice(&chunk[..]);
+                while let Some(chunk) = r
+                    .data
+                    .try_next()
+                    .await
+                    .map_err(|e| e.context(format!("failed to read chunk at {offs:#018X}")))?
+                {
+                    prog(chunk.len() as u64);
 
-                offs += chunk.len();
+                    map_slice[(offs as usize)..(offs as usize) + chunk.len()]
+                        .copy_from_slice(&chunk[..]);
+
+                    offs += chunk.len();
+                }
+
+                let chunk = range.start / (DEFAULT_CHUNK_SIZE as usize);
+                chunks.set_aliased(chunk, true);
+
+                Ok(())
             }
+        })
+        .await;
 
-            Ok(())
+    match r {
+        Ok(_) => {}
+        Err(e) => {
+            let c = chunks
+                .first_zero()
+                .expect(&format!("no chunks failed to download? {e:#}")) as u64;
+            let offs = c * DEFAULT_CHUNK_SIZE;
+
+            // Need to unmap the file before resizing it.
+            drop(map);
+
+            f.set_len(offs).context("failed to truncate file")?;
+            return Err(e).context("failed to download chunks");
         }
-    })
-    .await
-    .context("failed to download chunks")?;
+    }
+
+    // Assert that every chunk was downloaded.
+    assert!(chunks.all(), "{chunks:?}");
 
     map.flush().context("failed to flush mapped file")?;
     drop(map);
@@ -276,19 +338,35 @@ async fn sync_blobs(
                             .with_message(format!("{}", &blob.name)),
                     );
 
+                    // Query existing file for metadata (if any)
+                    let (past_len, trunc) = if let Ok(meta) = std::fs::metadata(&temp_file_path) {
+                        // If file length on disk is equal to the blob's length, just truncate it
+                        // since it was likely left over from a previous crash or something.
+                        if meta.len() == len {
+                            (None, true)
+                        } else {
+                            (Some(meta.len()), false)
+                        }
+                    } else {
+                        // No existing file.
+                        (None, true)
+                    };
+
                     let mut f = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
                         .create(true)
+                        .truncate(trunc)
                         .open(&temp_file_path)
                         .context("failed to create file for download")?;
+
                     f.set_len(len).context("failed to set file length")?;
 
                     // The length can be 0 sometimes...
                     // If it is, then the get request for the blob will fail.
                     if len != 0 {
-                        let bcl = client.blob_client(&blob.name);
-                        get_blob(bcl, &mut f, |len| {
+                        let blob_client = client.blob_client(&blob.name);
+                        get_blob(blob_client, &blob.properties, &mut f, past_len, |len| {
                             pb.inc(len);
                             fpb.inc(len);
                         })

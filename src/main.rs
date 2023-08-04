@@ -1,0 +1,440 @@
+#![feature(slice_from_ptr_range, file_set_times)]
+use std::{
+    fs::FileTimes,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{bail, Context};
+use azure_storage::prelude::*;
+use azure_storage_blobs::{blob::BlobProperties, container::operations::BlobItem, prelude::*};
+use clap::{Parser, Subcommand};
+use futures::{StreamExt, TryStreamExt};
+use indicatif::{MultiProgress, ProgressBar};
+use memmap2::MmapOptions;
+use tokio::io::AsyncReadExt;
+use url::Url;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Synchronize a file from remote storage to local storage
+    Sync {
+        /// The remote storage URL to synchronize from
+        remote_url: Url,
+        /// The local destination
+        local_path: PathBuf,
+    },
+}
+
+#[allow(dead_code)]
+mod style {
+    use indicatif::ProgressStyle;
+
+    pub fn style_prog() -> ProgressStyle {
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {wide_bar:.cyan/blue} {pos:>10}/{len:10} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  ")
+    }
+
+    pub fn style_prog_bytes() -> ProgressStyle {
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {wide_bar:.cyan/blue} {bytes:>12}/{total_bytes:12} {bytes_per_sec} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  ")
+    }
+
+    pub fn style_bytes() -> ProgressStyle {
+        ProgressStyle::default_bar()
+            .template(
+                "[{elapsed_precise}] {bar:.cyan/blue} {bytes:>12}/{total_bytes:12} {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  ")
+    }
+}
+
+fn parse_blob_name(blob_name: impl AsRef<str>) -> PathBuf {
+    let n = blob_name.as_ref();
+    let c = n.split('/');
+
+    let mut p = PathBuf::new();
+    for c in c {
+        p.push(c);
+    }
+
+    p
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerificationResult {
+    Verified,
+    Mismatch,
+    Unknown,
+}
+
+/// Verify if a file matches a blob
+async fn verify_file(
+    p: impl AsRef<Path>,
+    blob_props: &BlobProperties,
+    pb: Option<&ProgressBar>,
+) -> anyhow::Result<VerificationResult> {
+    let f = tokio::fs::File::open(p.as_ref())
+        .await
+        .context("failed to open file")?;
+
+    let meta = f
+        .metadata()
+        .await
+        .context("failed to query file metadata")?;
+
+    if let Some(md5) = &blob_props.content_md5 {
+        use md5::{Context, Digest};
+        use tokio::io::BufReader;
+
+        let mut context = Context::new();
+
+        // Read in file from disk and calculate md5.
+        let mut buf = [0u8; 8192];
+        let mut r = BufReader::new(f);
+
+        if let Some(pb) = pb {
+            pb.set_length(meta.len());
+        }
+
+        while let Ok(size) = r.read(&mut buf).await {
+            if size == 0 {
+                break;
+            }
+
+            if let Some(pb) = pb {
+                pb.inc(size as u64);
+            }
+
+            context.consume(&buf[..size]);
+        }
+
+        let digest = context.compute();
+        if digest == Digest(*md5.as_slice()) {
+            Ok(VerificationResult::Verified)
+        } else {
+            Ok(VerificationResult::Mismatch)
+        }
+    } else {
+        // No serverside hash exposed.
+        // Try to compare length.
+        if meta.len() != blob_props.content_length {
+            Ok(VerificationResult::Mismatch)
+        } else {
+            Ok(VerificationResult::Unknown)
+        }
+    }
+}
+
+async fn sync_blobs(
+    client: ContainerClient,
+    blobs: &[Blob],
+    target: PathBuf,
+) -> anyhow::Result<()> {
+    // Tally up total bytes that we'll be downloading...
+    let total_bytes = blobs
+        .iter()
+        .fold(0u64, |a, b| a + b.properties.content_length);
+
+    // Create target folder.
+    std::fs::create_dir_all(&target).context("failed to create target directory")?;
+
+    let m = MultiProgress::new();
+
+    // Display overall progress.
+    let pb = m.add(ProgressBar::new(total_bytes).with_style(style::style_prog_bytes()));
+
+    // TODO: Clean out extraneous files.
+
+    // Create download tasks for each file.
+    let downloads = futures::stream::iter(blobs.into_iter().map(|blob| {
+        // Capture variables from the outer function.
+        let client = client.clone();
+        let m = &m;
+        let pb = pb.clone();
+        let target = target.clone();
+
+        async move {
+            // Try and see if there is already a file on disk, and whether or not we should
+            // replace it.
+            let blob_path = parse_blob_name(&blob.name);
+            let file_path = target.join(&blob_path);
+
+            std::fs::create_dir_all(file_path.parent().unwrap())
+                .context("failed to create relative path")?;
+
+            let b = || async move {
+                let temp_file_path = file_path.with_file_name(format!(
+                    "{}.tmpdownload",
+                    file_path.file_name().unwrap().to_string_lossy()
+                ));
+
+                let should_download = if file_path.exists() {
+                    let vpb = m.add(
+                        ProgressBar::new(0)
+                            .with_style(style::style_bytes())
+                            .with_message(format!("verify {}", &blob.name)),
+                    );
+
+                    let result = verify_file(&file_path, &blob.properties, Some(&vpb))
+                        .await
+                        .context("failed to verify existing file")?;
+
+                    match result {
+                        VerificationResult::Verified => {
+                            vpb.finish_and_clear();
+                            false
+                        }
+                        VerificationResult::Mismatch => {
+                            // vpb.finish_with_message(format!("failed to verify {}", &blob.name));
+                            vpb.finish_and_clear();
+                            true
+                        }
+                        VerificationResult::Unknown => {
+                            vpb.finish_and_clear();
+                            false // TODO: Should we or should we not redownload unknown files?
+                        }
+                    }
+                } else {
+                    true
+                };
+
+                if should_download {
+                    let len = blob.properties.content_length;
+
+                    let fpb = m.add(
+                        ProgressBar::new(len)
+                            .with_style(style::style_bytes())
+                            .with_message(format!("{}", &blob.name)),
+                    );
+
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(&temp_file_path)
+                        .context("failed to create file for download")?;
+                    f.set_len(len).context("failed to set file length")?;
+
+                    // The length can be 0 sometimes...
+                    if len != 0 {
+                        let mut map = unsafe {
+                            MmapOptions::new()
+                                .map_mut(&f)
+                                .context("failed to map file into memory")?
+                        };
+
+                        let bcl = client.blob_client(&blob.name);
+                        let body = bcl.get().into_stream();
+
+                        body.try_for_each_concurrent(None, |mut r| {
+                            let pb = pb.clone();
+                            let fpb = fpb.clone();
+                            let map = map.as_mut_ptr_range();
+
+                            async move {
+                                let range = r
+                                    .content_range
+                                    .map(|r| r.start as usize..(r.end + 1) as usize)
+                                    .unwrap_or(0usize..r.blob.properties.content_length as usize);
+                                let mut offs = 0usize;
+
+                                // SAFETY: Who knows, probably unsafe?
+                                // Technically more than one thread should not have mutable access to memory,
+                                // but in practice everyone's writing to a blob of bytes.
+                                let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
+                                let map_slice = &mut map_slice[range];
+
+                                while let Some(chunk) = r.data.try_next().await? {
+                                    pb.inc(chunk.len() as u64);
+                                    fpb.inc(chunk.len() as u64);
+
+                                    map_slice[(offs as usize)..(offs as usize) + chunk.len()]
+                                        .copy_from_slice(&chunk[..]);
+
+                                    offs += chunk.len();
+                                }
+
+                                Ok(())
+                            }
+                        })
+                        .await
+                        .context("failed to download file")?;
+
+                        map.flush().context("failed to flush mapped file")?;
+                        drop(map);
+                    }
+
+                    // Setup file times.
+                    let ft = FileTimes::new();
+                    let ft = if let Some(access_time) = &blob.properties.last_access_time {
+                        ft.set_accessed((*access_time).into())
+                    } else {
+                        ft
+                    };
+
+                    let ft = ft.set_modified(blob.properties.last_modified.into());
+                    f.set_times(ft).context("failed to set file times")?;
+
+                    fpb.finish_and_clear();
+
+                    // Rename the file to its destination name.
+                    if file_path.exists() {
+                        tokio::fs::remove_file(&file_path)
+                            .await
+                            .context("failed to delete original file")?;
+                    }
+
+                    tokio::fs::rename(&temp_file_path, &file_path)
+                        .await
+                        .context("failed to rename file")?;
+
+                    let vpb = m.add(
+                        ProgressBar::new(len)
+                            .with_style(style::style_bytes())
+                            .with_message(format!("verify {}", &blob.name)),
+                    );
+
+                    match verify_file(&file_path, &blob.properties, Some(&vpb))
+                        .await
+                        .context("failed to verify written file")?
+                    {
+                        VerificationResult::Unknown | VerificationResult::Verified => {
+                            vpb.finish_and_clear();
+
+                            Ok(())
+                        }
+                        VerificationResult::Mismatch => {
+                            bail!("downloaded file but verification failed")
+                        }
+                    }
+                } else {
+                    pb.inc(blob.properties.content_length);
+
+                    Ok(())
+                }
+            };
+
+            b().await
+                .context(format!("failed to download file {}", &blob.name))?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+    }))
+    .buffer_unordered(64)
+    .collect::<Vec<Result<(), anyhow::Error>>>()
+    .await;
+
+    for r in downloads {
+        if let Err(e) = r {
+            log::error!("{e:?}");
+        }
+    }
+
+    pb.finish();
+
+    Ok(())
+}
+
+async fn run() -> anyhow::Result<()> {
+    env_logger::init();
+
+    // sync <remote-url> <local-folder>
+    // - SAS URL: fetch blob names if container
+    //   - URL scheme: https://<account>.blob.core.windows.net/<container>/<file?>?<SAS-parameters>
+    //   - https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs?tabs=azure-ad
+    //   -
+    //
+    let args = Args::parse();
+
+    match args.command {
+        Commands::Sync {
+            remote_url,
+            local_path,
+        } => {
+            // Determine the account.
+            let account = if let Some(domain) = remote_url.domain() {
+                // Split out the subdomain.
+                if let Some(subdomain) = domain.split('.').next() {
+                    subdomain
+                } else {
+                    bail!("could not parse domain: {domain}");
+                }
+            } else {
+                bail!("unsupported URL: {remote_url}");
+            };
+
+            // Determine if the URL is an SAS URL.
+            let creds = if remote_url.query_pairs().any(|(a, _)| a == "sig") {
+                // This is an SAS URL.
+                // FIXME: Somehow avoid that unwrapping?
+                StorageCredentials::sas_token(remote_url.query().unwrap())
+                    .context("failed to parse SAS token")?
+            } else {
+                todo!()
+            };
+
+            let client = ClientBuilder::new(account, creds);
+
+            let mut segments = remote_url
+                .path_segments()
+                .context("SAS URL has no path segments")?;
+            let container = segments.next().context("no container specified")?;
+            let file = segments.next();
+
+            if let Some(_file) = file {
+                // TODO: Downloading a single file...
+                todo!()
+            } else {
+                let client = client.container_client(container);
+                let blob_items = client
+                    .list_blobs()
+                    .into_stream()
+                    .map_ok(|b| {
+                        // HACK: Not really sure why I have to map the inner here, but
+                        // we quickly get into trait hell if it isn't mapped to a Result<_>.
+                        futures::stream::iter(
+                            b.blobs.items.into_iter().map(|b| Ok::<_, anyhow::Error>(b)),
+                        )
+                    })
+                    .try_flatten()
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let blobs = blob_items
+                    .into_iter()
+                    .filter_map(|b| {
+                        if let BlobItem::Blob(b) = b {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                sync_blobs(client, &blobs, local_path)
+                    .await
+                    .context("failed to sync blobs")?;
+            }
+
+            Ok(())
+        }
+    }
+}
+
+/// Main stub. Used to avoid macro shenanigans with rust-analyzer.
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run().await
+}

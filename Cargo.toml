@@ -1,0 +1,20 @@
+[package]
+name = "razcopy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.72"
+azure_storage = "0.13.0"
+azure_storage_blobs = "0.13.1"
+clap = { version = "4.3.19", features = ["derive"] }
+env_logger = "0.10.0"
+futures = "0.3.28"
+indicatif = "0.17.6"
+log = "0.4.19"
+md5 = "0.7.0"
+memmap2 = "0.7.1"
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros"] }
+url = "2.4.0"

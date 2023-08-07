@@ -190,8 +190,10 @@ async fn get_blob(
             .fill(true);
     }
 
+    // FIXME: Not sure about the concurrency limit.
+    // Too many, and Azure throws authentication errors (instead of rate limit errors?)
     let r = body
-        .try_for_each_concurrent(Some(8), |mut r| {
+        .try_for_each_concurrent(Some(32), |mut r| {
             let prog = &prog;
             let map = map.as_mut_ptr_range();
             let chunks = &chunks;
@@ -250,7 +252,7 @@ async fn get_blob(
     // Assert that every chunk was downloaded.
     assert!(chunks.all(), "{chunks:?}");
 
-    map.flush().context("failed to flush mapped file")?;
+    map.flush_async().context("failed to flush mapped file")?;
     drop(map);
 
     Ok(())

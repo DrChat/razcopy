@@ -157,6 +157,8 @@ async fn get_blob(
             .context("failed to map file into memory")?
     };
 
+    let map_range = map.as_mut_ptr_range();
+
     // `skip` should be a multiple of the chunk size.
     let skip = skip.unwrap_or(0);
     let skip_chunks = skip / DEFAULT_CHUNK_SIZE;
@@ -195,8 +197,9 @@ async fn get_blob(
     let r = body
         .try_for_each_concurrent(Some(32), |mut r| {
             let prog = &prog;
-            let map = map.as_mut_ptr_range();
             let chunks = &chunks;
+            let map_range = map_range.clone();
+            let map = &map;
 
             async move {
                 let range = r
@@ -208,7 +211,7 @@ async fn get_blob(
                 // SAFETY: Who knows, probably unsafe?
                 // Technically more than one thread should not have mutable access to memory,
                 // but in practice everyone's writing to a blob of bytes.
-                let map_slice = unsafe { std::slice::from_mut_ptr_range(map) };
+                let map_slice = unsafe { std::slice::from_mut_ptr_range(map_range) };
                 let map_slice = &mut map_slice[range.clone()];
 
                 while let Some(chunk) = r
@@ -224,6 +227,9 @@ async fn get_blob(
 
                     offs += chunk.len();
                 }
+
+                // Flush the range of bytes we just wrote, ignoring any errors.
+                let _ = map.flush_async_range(range.start, range.end - range.start);
 
                 let chunk = range.start / (DEFAULT_CHUNK_SIZE as usize);
                 chunks.set_aliased(chunk, true);

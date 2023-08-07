@@ -191,7 +191,7 @@ async fn get_blob(
     }
 
     let r = body
-        .try_for_each_concurrent(None, |mut r| {
+        .try_for_each_concurrent(Some(8), |mut r| {
             let prog = &prog;
             let map = map.as_mut_ptr_range();
             let chunks = &chunks;
@@ -366,12 +366,18 @@ async fn sync_blobs(
                     // If it is, then the get request for the blob will fail.
                     if len != 0 {
                         let blob_client = client.blob_client(&blob.name);
-                        get_blob(blob_client, &blob.properties, &mut f, past_len, |len| {
+                        match get_blob(blob_client, &blob.properties, &mut f, past_len, |len| {
                             pb.inc(len);
                             fpb.inc(len);
                         })
                         .await
-                        .context("failed to get blob")?;
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                fpb.finish_with_message(format!("{} failed: {}", &blob.name, &e));
+                                return Err(e).context("failed to get blob")?;
+                            }
+                        }
                     }
 
                     // Setup file times.
@@ -385,8 +391,6 @@ async fn sync_blobs(
                     let ft = ft.set_modified(blob.properties.last_modified.into());
                     f.set_times(ft).context("failed to set file times")?;
 
-                    fpb.finish_and_clear();
-
                     // Rename the file to its destination name.
                     if file_path.exists() {
                         tokio::fs::remove_file(&file_path)
@@ -398,18 +402,15 @@ async fn sync_blobs(
                         .await
                         .context("failed to rename file")?;
 
-                    let vpb = m.add(
-                        ProgressBar::new(len)
-                            .with_style(style::style_bytes())
-                            .with_message(format!("verify {}", &blob.name)),
-                    );
+                    fpb.set_message(format!("verify {}", &blob.name));
+                    fpb.set_position(0);
 
-                    match verify_file(&file_path, &blob.properties, Some(&vpb))
+                    match verify_file(&file_path, &blob.properties, Some(&fpb))
                         .await
                         .context("failed to verify written file")?
                     {
                         VerificationResult::Unknown | VerificationResult::Verified => {
-                            vpb.finish_and_clear();
+                            fpb.finish_and_clear();
 
                             Ok(())
                         }

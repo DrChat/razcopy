@@ -1,8 +1,6 @@
 # (Rust) azcopy
 [AzCopy](https://github.com/Azure/azure-storage-azcopy) rewritten in Rust, for the lulz and efficiency gainz.
 
-Unlike `azcopy`, this tool downloads files directly to the hard disk (azcopy downloads to RAM and then copies to disk).
-
 ## Features and capabilities
 ❌ Use with storage accounts that have a hierarchical namespace (Azure Data Lake Storage Gen2).
 
@@ -16,9 +14,7 @@ Unlike `azcopy`, this tool downloads files directly to the hard disk (azcopy dow
 
 ✳️ Synchronize data between Local <=> Blob Storage, Blob Storage <=> File Storage, and Local <=> File Storage.
 
-✅ Recover from failures by restarting previous jobs.
-
-✅ Fails to download files randomly.
+✳️ Recover from failures by restarting previous jobs.
 
 ❌ Delete blobs or files from an Azure storage account
 

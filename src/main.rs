@@ -157,7 +157,17 @@ async fn get_blob(
             .context("failed to map file into memory")?
     };
 
-    let map_range = map.as_mut_ptr_range();
+    struct SendSyncSafe<T>(T);
+    unsafe impl<T> Send for SendSyncSafe<T> {}
+    unsafe impl<T> Sync for SendSyncSafe<T> {}
+    impl<T: Clone> Clone for SendSyncSafe<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    // HACK: Mark the raw pointer as send + sync so we can ferry it across .await points.
+    let map_range = SendSyncSafe(map.as_mut_ptr_range());
 
     // `skip` should be a multiple of the chunk size.
     let skip = skip.unwrap_or(0);
@@ -198,10 +208,12 @@ async fn get_blob(
         .try_for_each_concurrent(Some(32), |mut r| {
             let prog = &prog;
             let chunks = &chunks;
-            let map_range = map_range.clone();
-            let map = &map;
+            let map_range = &map_range;
+            // let map = &map;
 
             async move {
+                let map_range = map_range.clone();
+
                 let range = r
                     .content_range
                     .map(|r| r.start as usize..(r.end + 1) as usize)
@@ -211,7 +223,7 @@ async fn get_blob(
                 // SAFETY: Who knows, probably unsafe?
                 // Technically more than one thread should not have mutable access to memory,
                 // but in practice everyone's writing to a blob of bytes.
-                let map_slice = unsafe { std::slice::from_mut_ptr_range(map_range) };
+                let map_slice = unsafe { std::slice::from_mut_ptr_range(map_range.0) };
                 let map_slice = &mut map_slice[range.clone()];
 
                 while let Some(chunk) = r
@@ -229,7 +241,9 @@ async fn get_blob(
                 }
 
                 // Flush the range of bytes we just wrote, ignoring any errors.
-                let _ = map.flush_async_range(range.start, range.end - range.start);
+                // FIXME: Need to do this on a blocking worker instead. The system likes to
+                // block this operation.
+                // let _ = map.flush_async_range(range.start, range.end - range.start);
 
                 let chunk = range.start / (DEFAULT_CHUNK_SIZE as usize);
                 chunks.set_aliased(chunk, true);
@@ -288,20 +302,23 @@ async fn sync_blobs(
     let downloads = futures::stream::iter(blobs.into_iter().map(|blob| {
         // Capture variables from the outer function.
         let client = client.clone();
-        let m = &m;
+        let m = m.clone();
         let pb = pb.clone();
         let target = target.clone();
 
         async move {
+            let blob = blob.clone();
+            let blob_name = blob.name.clone();
+
             // Try and see if there is already a file on disk, and whether or not we should
             // replace it.
-            let blob_path = parse_blob_name(&blob.name);
+            let blob_path = parse_blob_name(&blob_name);
             let file_path = target.join(&blob_path);
 
             std::fs::create_dir_all(file_path.parent().unwrap())
                 .context("failed to create relative path")?;
 
-            let b = || async move {
+            tokio::spawn(async move {
                 let temp_file_path = file_path.with_file_name(format!(
                     "{}.tmpdownload",
                     file_path.file_name().unwrap().to_string_lossy()
@@ -431,12 +448,10 @@ async fn sync_blobs(
 
                     Ok(())
                 }
-            };
-
-            b().await
-                .context(format!("failed to download file {}", &blob.name))?;
-
-            Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context(format!("failed to join file task for {}", &blob_name))?
+            .context(format!("failed to download file {}", &blob_name))
         }
     }))
     .buffer_unordered(64)

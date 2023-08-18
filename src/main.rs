@@ -151,23 +151,11 @@ async fn get_blob(
 ) -> anyhow::Result<()> {
     const DEFAULT_CHUNK_SIZE: u64 = 0x1000 * 0x1000;
 
-    let mut map = unsafe {
-        MmapOptions::new()
-            .map_mut(&*f)
-            .context("failed to map file into memory")?
-    };
+    let map = MmapOptions::new()
+        .map_raw(&*f)
+        .context("failed to map file into memory")?;
 
-    struct SendSyncSafe<T>(T);
-    unsafe impl<T> Send for SendSyncSafe<T> {}
-    unsafe impl<T> Sync for SendSyncSafe<T> {}
-    impl<T: Clone> Clone for SendSyncSafe<T> {
-        fn clone(&self) -> Self {
-            Self(self.0.clone())
-        }
-    }
-
-    // HACK: Mark the raw pointer as send + sync so we can ferry it across .await points.
-    let map_range = SendSyncSafe(map.as_mut_ptr_range());
+    let map_range = (map.as_mut_ptr() as usize, map.len());
 
     // `skip` should be a multiple of the chunk size.
     let skip = skip.unwrap_or(0);
@@ -223,7 +211,8 @@ async fn get_blob(
                 // SAFETY: Who knows, probably unsafe?
                 // Technically more than one thread should not have mutable access to memory,
                 // but in practice everyone's writing to a blob of bytes.
-                let map_slice = unsafe { std::slice::from_mut_ptr_range(map_range.0) };
+                let map_slice =
+                    unsafe { std::slice::from_raw_parts_mut(map_range.0 as *mut u8, map_range.1) };
                 let map_slice = &mut map_slice[range.clone()];
 
                 while let Some(chunk) = r

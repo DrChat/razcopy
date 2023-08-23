@@ -31,6 +31,9 @@ enum Commands {
         remote_url: Url,
         /// The local destination
         local_path: PathBuf,
+        /// Whether or not to recursively sync the directory tree.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        recursive: bool,
     },
 }
 
@@ -473,7 +476,12 @@ async fn run() -> anyhow::Result<()> {
         Commands::Sync {
             remote_url,
             local_path,
+            recursive,
         } => {
+            if !recursive {
+                bail!("non-recursive sync is unsupported");
+            }
+
             // Determine the account.
             let account = if let Some(domain) = remote_url.domain() {
                 // Split out the subdomain.

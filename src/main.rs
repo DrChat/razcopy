@@ -264,7 +264,8 @@ async fn get_blob(
     // Assert that every chunk was downloaded.
     assert!(chunks.all(), "{chunks:?}");
 
-    map.flush_async().context("failed to flush mapped file")?;
+    // This is not actually async in practice :)
+    // map.flush_async().context("failed to flush mapped file")?;
     drop(map);
 
     Ok(())

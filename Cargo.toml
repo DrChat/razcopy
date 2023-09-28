@@ -11,8 +11,8 @@ debug = true
 
 [dependencies]
 anyhow = "1.0.72"
-azure_storage = "0.15.0"
-azure_storage_blobs = "0.15.0"
+azure_storage = "0.16"
+azure_storage_blobs = "0.16"
 bitvec = "1.0.1"
 clap = { version = "4.3.19", features = ["derive"] }
 env_logger = "0.10.0"

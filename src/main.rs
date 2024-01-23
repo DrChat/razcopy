@@ -451,13 +451,13 @@ async fn sync_blobs(
     .collect::<Vec<Result<(), anyhow::Error>>>()
     .await;
 
+    pb.finish();
+
     for r in downloads {
         if let Err(e) = r {
             log::error!("{e:?}");
         }
     }
-
-    pb.finish();
 
     Ok(())
 }

@@ -1,8 +1,7 @@
-#![feature(slice_from_ptr_range, file_set_times)]
 use std::{
     fs::FileTimes,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 use anyhow::{bail, Context};
@@ -12,7 +11,7 @@ use bitvec::vec::BitVec;
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar};
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, MmapRaw};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
@@ -142,6 +141,30 @@ async fn verify_file(
     }
 }
 
+#[derive(Clone)]
+struct UnsafeSharedMmap {
+    map: Arc<MmapRaw>,
+}
+
+impl UnsafeSharedMmap {
+    fn new(map: MmapRaw) -> Self {
+        Self { map: Arc::new(map) }
+    }
+
+    /// SAFETY: You must ensure that you are not creating mutable overlapping slices.
+    unsafe fn get_mut(&self, range: &std::ops::Range<usize>) -> Option<&mut [u8]> {
+        let map_range = 0..self.map.len();
+        if range.start > map_range.end || map_range.start > range.end {
+            return None;
+        }
+
+        Some(std::slice::from_raw_parts_mut(
+            self.map.as_mut_ptr().add(range.start),
+            range.end - range.start,
+        ))
+    }
+}
+
 /// Attempt to download a blob from an Azure storage account.
 ///
 /// This expects that you've already sized the file to the blob's final size.
@@ -157,8 +180,7 @@ async fn get_blob(
     let map = MmapOptions::new()
         .map_raw(&*f)
         .context("failed to map file into memory")?;
-
-    let map_range = (map.as_mut_ptr() as usize, map.len());
+    let map = UnsafeSharedMmap::new(map);
 
     // `skip` should be a multiple of the chunk size.
     let skip = skip.unwrap_or(0);
@@ -199,11 +221,11 @@ async fn get_blob(
         .try_for_each_concurrent(Some(32), |mut r| {
             let prog = &prog;
             let chunks = &chunks;
-            let map_range = &map_range;
+            let map = &map;
             // let map = &map;
 
             async move {
-                let map_range = map_range.clone();
+                let map = map.clone();
 
                 let range = r
                     .content_range
@@ -214,9 +236,7 @@ async fn get_blob(
                 // SAFETY: Who knows, probably unsafe?
                 // Technically more than one thread should not have mutable access to memory,
                 // but in practice everyone's writing to a blob of bytes.
-                let map_slice =
-                    unsafe { std::slice::from_raw_parts_mut(map_range.0 as *mut u8, map_range.1) };
-                let map_slice = &mut map_slice[range.clone()];
+                let map_slice = unsafe { map.get_mut(&range) }.unwrap();
 
                 while let Some(chunk) = r
                     .data
